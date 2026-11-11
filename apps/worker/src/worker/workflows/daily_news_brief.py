@@ -120,6 +120,12 @@ async def fetch_feed(country: str, source: str, url: str, max_items: int) -> lis
 @workflows.activity()
 async def write_brief(feed_items: list[dict], model: str) -> str:
     """Call a Mistral model to write the brief from the fetched headlines."""
+    from datetime import datetime
+
+    # The current date is computed in the activity (allowed: activities may
+    # use non-deterministic sources) so the model never has to guess it.
+    today = datetime.now().strftime("%A %-d %B %Y")
+
     grouped: dict[str, list[dict]] = {country: [] for country in COUNTRIES}
     for item in feed_items:
         grouped.setdefault(item["country"], []).append(item)
@@ -133,8 +139,9 @@ async def write_brief(feed_items: list[dict], model: str) -> str:
         sections.append("\n".join(lines))
 
     prompt = (
-        "You are writing Guðmundur's daily morning news brief covering the "
-        "United Kingdom, Ireland, Sweden and Denmark, from news of the last 24 hours.\n\n"
+        f"You are writing Guðmundur's daily morning news brief for **{today}**, "
+        "covering the United Kingdom, Ireland, Sweden and Denmark, from news of the "
+        "last 24 hours.\n\n"
         "Rules:\n"
         "- Organise by country with clear headings, preceded by a one-paragraph overview "
         "of the biggest story overall.\n"
@@ -147,7 +154,8 @@ async def write_brief(feed_items: list[dict], model: str) -> str:
         "- If a country has no significant news, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
         "- If a headline's summary is thin, present the story cautiously from the headline "
-        "alone rather than inventing detail.\n\n"
+        "alone rather than inventing detail.\n"
+        f"- Date the brief {today}.\n\n"
         "Fetched headlines (last 24 hours):\n\n" + "\n\n".join(sections)
     )
 
