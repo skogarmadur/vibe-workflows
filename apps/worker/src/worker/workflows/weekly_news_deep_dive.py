@@ -1,4 +1,4 @@
-"""Weekly news deep-dive workflow: UK, Ireland, Sweden, Denmark.
+"""Weekly news deep-dive workflow: UK, Ireland, Sweden, Denmark, France.
 
 Sunday complement to the daily brief: fetches a wider set of domestic-language
 RSS feeds, then writes Guðmundur's weekly deep-dive report via a Mistral model
@@ -25,7 +25,8 @@ from mistralai.workflows.plugins.mistralai import (
 from pydantic import BaseModel, Field
 
 # Public RSS feeds, verified reachable on 2026-11-12. Wider than the daily brief:
-# adds Irish Times, SvD, Expressen, GP, Berlingske and the Guardian's world feed.
+# adds Irish Times, SvD, Expressen, GP, Berlingske, the Guardian's world feed,
+# four French outlets, and the Guardian's environment feed for standing interests.
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
     ("UK", "The Guardian", "https://www.theguardian.com/uk/rss"),
@@ -41,9 +42,14 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
     ("Denmark", "Politiken", "https://politiken.dk/rss/senestenyt.rss"),
     ("Denmark", "Ekstra Bladet", "https://ekstrabladet.dk/rssfeed/all/"),
     ("Denmark", "Berlingske", "https://www.berlingske.dk/content/rss"),
+    ("France", "Le Monde", "https://www.lemonde.fr/rss/une.xml"),
+    ("France", "Le Figaro", "https://www.lefigaro.fr/rss/figaro_actualites.xml"),
+    ("France", "franceinfo", "https://www.francetvinfo.fr/titres.rss"),
+    ("France", "Ouest-France", "https://www.ouest-france.fr/rss-en-continu.xml"),
+    ("Topics", "The Guardian (Environment)", "https://www.theguardian.com/environment/rss"),
 )
 
-COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark")
+COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France", "Topics")
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -144,18 +150,26 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
 
     prompt = (
         f"You are writing Guðmundur's weekly news deep-dive report for **{today}**, "
-        "covering the United Kingdom, Ireland, Sweden and Denmark, reviewing the week "
-        "just ended and looking ahead.\n\n"
+        "covering the United Kingdom, Ireland, Sweden, Denmark and France, reviewing "
+        "the week just ended and looking ahead.\n\n"
         "Rules:\n"
         "- Organise by country with clear headings, preceded by a one-paragraph overview "
-        "of the week across all four countries.\n"
+        "of the week across all five countries.\n"
         "- This is the fullest analysis of the week: deeper and more exhaustive than the "
         "daily morning brief. For each significant story: what happened, why it matters — "
         "background, implications, key reactions and stakeholders — and what to watch next. "
         "Trace developments across the week rather than listing single headlines.\n"
-        "- Draw on domestic-language sources (Swedish, Danish, Irish) for local perspective "
-        "and commentary; translate into English. Cross-reference international sources "
-        "for cross-border stories.\n"
+        "- Draw on domestic-language sources (Swedish, Danish, French, Irish) for local "
+        "perspective and commentary; translate into English. Cross-reference international "
+        "sources for cross-border stories.\n"
+        "- Guðmundur has a standing interest in forestry, woodland restoration and "
+        "conservation. Whenever a story in these areas appears — in any country or in "
+        "the Topics feed — include it with the same thorough treatment. Do not force "
+        "coverage if nothing relevant appears.\n"
+        "- The 'Topics' feed (Guardian Environment) is a source for forestry/conservation "
+        "and other environmental stories across countries; fold relevant items into the "
+        "country sections (or the UK section for UK-only stories) rather than creating "
+        "a separate Topics heading.\n"
         "- Cite sources with the links given. If a summary is thin, present the story "
         "cautiously from the headline alone rather than inventing detail.\n"
         "- End with a short 'The week ahead' section of things to watch in each country.\n"
