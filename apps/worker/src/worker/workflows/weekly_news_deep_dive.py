@@ -6,6 +6,9 @@ call. Deeper analysis than the daily brief; draws on commentary and analysis
 angles where the feeds expose them. Designed for an unattended scheduled run:
 reads only public feeds, no user-scope credentials. Deliverable is the
 execution result (read in Studio / delivered via the 08:35 relay task).
+
+Activity names are suffixed `_deepdive` because activity names must be unique
+across all workflows served by this worker.
 """
 
 from __future__ import annotations
@@ -72,14 +75,6 @@ class DeepDiveInput(BaseModel):
     dry_run: bool = False
 
 
-class FeedItem(BaseModel):
-    country: str
-    source: str
-    title: str
-    link: str
-    summary: str
-
-
 class DeepDiveOutput(BaseModel):
     report_markdown: str
     feeds_ok: list[str]
@@ -89,7 +84,7 @@ class DeepDiveOutput(BaseModel):
 
 
 @workflows.activity()
-async def fetch_feed(country: str, source: str, url: str, max_items: int) -> list[dict]:
+async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: int) -> list[dict]:
     """Fetch and parse one public RSS feed. Failures return [] (handled upstream)."""
     import httpx
 
@@ -127,7 +122,7 @@ async def fetch_feed(country: str, source: str, url: str, max_items: int) -> lis
 
 
 @workflows.activity()
-async def write_report(feed_items: list[dict], model: str) -> str:
+async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
     """Call a Mistral model to write the weekly deep-dive report."""
     from datetime import datetime
 
@@ -186,7 +181,7 @@ class WeeklyNewsDeepDiveWorkflow:
         feeds_ok: list[str] = []
         feeds_failed: list[str] = []
         for country, source, url in FEEDS:
-            feed_items = await fetch_feed(country, source, url, data.max_items_per_feed)
+            feed_items = await fetch_feed_deepdive(country, source, url, data.max_items_per_feed)
             if feed_items:
                 items.extend(feed_items)
                 feeds_ok.append(f"{source} ({country})")
@@ -206,7 +201,7 @@ class WeeklyNewsDeepDiveWorkflow:
                 model="(dry run, no model call)",
             )
 
-        report = await write_report(items, data.model)
+        report = await write_deep_dive_report(items, data.model)
         return DeepDiveOutput(
             report_markdown=report,
             feeds_ok=feeds_ok,
