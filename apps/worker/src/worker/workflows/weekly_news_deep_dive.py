@@ -143,7 +143,7 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
         sections.append("\n".join(lines))
 
     prompt = (
-        f"You are writing Guðmundur's weekly news deep-dive report for **Sunday {today}**, "
+        f"You are writing Guðmundur's weekly news deep-dive report for **{today}**, "
         "covering the United Kingdom, Ireland, Sweden and Denmark, reviewing the week "
         "just ended and looking ahead.\n\n"
         "Rules:\n"
@@ -161,7 +161,7 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
         "- End with a short 'The week ahead' section of things to watch in each country.\n"
         "- If a country had a quiet week, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
-        f"- Date the report Sunday {today}.\n\n"
+        f"- Date the report {today}.\n\n"
         "Fetched headlines:\n\n" + "\n\n".join(sections)
     )
 
