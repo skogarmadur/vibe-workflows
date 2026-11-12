@@ -1,4 +1,4 @@
-"""Daily news brief workflow: UK, Ireland, Sweden, Denmark.
+"""Daily news brief workflow: UK, Ireland, Sweden, Denmark, France.
 
 Fetches headlines from domestic-language RSS feeds for the last 24 hours,
 then writes Guðmundur's morning brief format via a Mistral model call.
@@ -19,7 +19,8 @@ from mistralai.workflows.plugins.mistralai import (
 )
 from pydantic import BaseModel, Field
 
-# Public RSS feeds, verified reachable on 2026-11-08. One feed per (country, source).
+# Public RSS feeds, verified reachable 2026-11-12. One feed per (country, source).
+# "Topics" feeds cover standing interests that cross borders.
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
     ("UK", "The Guardian", "https://www.theguardian.com/uk/rss"),
@@ -29,9 +30,12 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
     ("Sweden", "Dagens Nyheter", "https://www.dn.se/nyheter/rss/"),
     ("Denmark", "Politiken", "https://politiken.dk/rss/senestenyt.rss"),
     ("Denmark", "Ekstra Bladet", "https://ekstrabladet.dk/rssfeed/all/"),
+    ("France", "Le Monde", "https://www.lemonde.fr/rss/une.xml"),
+    ("France", "franceinfo", "https://www.francetvinfo.fr/titres.rss"),
+    ("Topics", "The Guardian (Environment)", "https://www.theguardian.com/environment/rss"),
 )
 
-COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark")
+COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France", "Topics")
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -140,17 +144,25 @@ async def write_brief(feed_items: list[dict], model: str) -> str:
 
     prompt = (
         f"You are writing Guðmundur's daily morning news brief for **{today}**, "
-        "covering the United Kingdom, Ireland, Sweden and Denmark, from news of the "
-        "last 24 hours.\n\n"
+        "covering the United Kingdom, Ireland, Sweden, Denmark and France, from news "
+        "of the last 24 hours.\n\n"
         "Rules:\n"
         "- Organise by country with clear headings, preceded by a one-paragraph overview "
         "of the biggest story overall.\n"
         "- For each story: what happened, and why it matters — background, implications, "
         "key reactions and stakeholders. For developing stories, note what to watch next.\n"
-        "- Cite sources with the links given. Translate Swedish and Danish headlines and "
-        "summaries into English.\n"
+        "- Cite sources with the links given. Translate Swedish, Danish and French "
+        "headlines and summaries into English.\n"
         "- Depth over breadth: pick the most significant stories and treat them thoroughly; "
         "this is a thorough but digestible morning read, not an exhaustive report.\n"
+        "- Guðmundur has a standing interest in forestry, woodland restoration and "
+        "conservation. Whenever a story in these areas appears — in any country or in "
+        "the Topics feed — include it and give it the same thorough treatment. Do not "
+        "force coverage if nothing relevant appears.\n"
+        "- The 'Topics' feed (Guardian Environment) is a source for forestry/conservation "
+        "and other environmental stories across countries; fold relevant items into the "
+        "country sections (or the UK section for UK-only stories) rather than creating "
+        "a separate Topics heading.\n"
         "- If a country has no significant news, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
         "- If a headline's summary is thin, present the story cautiously from the headline "
