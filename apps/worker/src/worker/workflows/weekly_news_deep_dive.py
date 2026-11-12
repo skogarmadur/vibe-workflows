@@ -89,7 +89,7 @@ class DeepDiveOutput(BaseModel):
 
 
 @workflows.activity()
-async def fetch_feed(country: str, source: str, url: str, max_items: int) -> list[dict]:
+async def fetch_feed_deep_dive(country: str, source: str, url: str, max_items: int) -> list[dict]:
     """Fetch and parse one public RSS feed. Failures return [] (handled upstream)."""
     from datetime import datetime, timedelta, timezone
     from email.utils import parsedate_to_datetime
@@ -204,7 +204,7 @@ class WeeklyNewsDeepDiveWorkflow:
         feeds_ok: list[str] = []
         feeds_failed: list[str] = []
         for country, source, url in FEEDS:
-            feed_items = await fetch_feed(country, source, url, data.max_items_per_feed)
+            feed_items = await fetch_feed_deep_dive(country, source, url, data.max_items_per_feed)
             if feed_items:
                 items.extend(feed_items)
                 feeds_ok.append(f"{source} ({country})")
