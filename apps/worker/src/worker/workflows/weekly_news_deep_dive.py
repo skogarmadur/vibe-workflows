@@ -1,10 +1,11 @@
 """Weekly news deep-dive workflow: UK, Ireland, Sweden, Denmark.
 
-Fetches headlines from domestic-language RSS feeds for the last 7 days,
-then writes Guðmundur's Sunday deep-dive report via a Mistral model call.
-Designed for an unattended scheduled run (Sunday 08:30): reads only public
-feeds, no user-scope credentials. Deliverable is the execution result,
-relayed into chat by a scheduled task at 08:35.
+Sunday complement to the daily brief: fetches a wider set of domestic-language
+RSS feeds, then writes Guðmundur's weekly deep-dive report via a Mistral model
+call. Deeper analysis than the daily brief; draws on commentary and analysis
+angles where the feeds expose them. Designed for an unattended scheduled run:
+reads only public feeds, no user-scope credentials. Deliverable is the
+execution result (read in Studio / delivered via the 08:35 relay task).
 """
 
 from __future__ import annotations
@@ -20,24 +21,23 @@ from mistralai.workflows.plugins.mistralai import (
 )
 from pydantic import BaseModel, Field
 
-# Public RSS feeds, verified reachable on 2026-11-12. One feed per (country, source).
-# DR and Aftonbladet publish no working public RSS and are therefore not included.
+# Public RSS feeds, verified reachable on 2026-11-12. Wider than the daily brief:
+# adds Irish Times, SvD, Expressen, GP, Berlingske and the Guardian's world feed.
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
     ("UK", "The Guardian", "https://www.theguardian.com/uk/rss"),
+    ("UK", "The Guardian (World)", "https://www.theguardian.com/world/rss"),
     ("Ireland", "RTÉ", "https://www.rte.ie/feeds/rss/?index=/news/"),
-    ("Ireland", "TheJournal.ie", "https://www.thejournal.ie/feed/"),
     ("Ireland", "The Irish Times", "https://www.irishtimes.com/arc/outboundfeeds/rss/"),
-    ("Ireland", "Irish Independent", "https://www.independent.ie/rss"),
+    ("Ireland", "TheJournal.ie", "https://www.thejournal.ie/feed/"),
     ("Sweden", "SVT Nyheter", "https://www.svt.se/nyheter/rss.xml"),
     ("Sweden", "Dagens Nyheter", "https://www.dn.se/nyheter/rss/"),
-    ("Sweden", "Expressen", "https://feeds.expressen.se/nyheter/"),
-    ("Sweden", "Svenska Dagbladet", "https://www.svd.se/?service=rss&type=senastenytt"),
+    ("Sweden", "Svenska Dagbladet", "https://www.svd.se/?service=rss"),
+    ("Sweden", "Expressen", "https://www.expressen.se/rss/nyheter/"),
     ("Sweden", "Göteborgs-Posten", "https://www.gp.se/rss"),
     ("Denmark", "Politiken", "https://politiken.dk/rss/senestenyt.rss"),
     ("Denmark", "Ekstra Bladet", "https://ekstrabladet.dk/rssfeed/all/"),
     ("Denmark", "Berlingske", "https://www.berlingske.dk/content/rss"),
-    ("Denmark", "B.T.", "https://www.bt.dk/bt/seneste/rss"),
 )
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark")
@@ -65,7 +65,7 @@ def _text(element: ET.Element, tag: str) -> str | None:
 
 
 class DeepDiveInput(BaseModel):
-    """Input for the weekly deep dive."""
+    """Input for the weekly news deep dive."""
 
     max_items_per_feed: int = Field(default=15, ge=1, le=40)
     model: str = "mistral-large-latest"
@@ -89,23 +89,18 @@ class DeepDiveOutput(BaseModel):
 
 
 @workflows.activity()
-async def fetch_feed_deep_dive(country: str, source: str, url: str, max_items: int) -> list[dict]:
+async def fetch_feed(country: str, source: str, url: str, max_items: int) -> list[dict]:
     """Fetch and parse one public RSS feed. Failures return [] (handled upstream)."""
-    from datetime import datetime, timedelta, timezone
-    from email.utils import parsedate_to_datetime
-
     import httpx
 
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(15.0),
-        headers={"User-Agent": "Mozilla/5.0 (compatible; news-deep-dive-workflow/1.0)"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; news-brief-workflow/1.0)"},
         follow_redirects=True,
     ) as client:
         response = await client.get(url)
         response.raise_for_status()
         content = response.text
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
 
     items: list[dict] = []
     try:
@@ -116,29 +111,16 @@ async def fetch_feed_deep_dive(country: str, source: str, url: str, max_items: i
         title = _clean(_text(element, "title"))
         link = (_text(element, "link") or "").strip()
         summary = _clean(_text(element, "description"))
-        if not (title and link):
-            continue
-        # Keep items from the last 7 days when a date is parseable; keep
-        # undated items (some feeds omit pubDate) so nothing is lost.
-        pub_date = _text(element, "pubDate")
-        if pub_date:
-            try:
-                parsed = parsedate_to_datetime(pub_date)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                if parsed < cutoff:
-                    continue
-            except (TypeError, ValueError):
-                pass
-        items.append(
-            {
-                "country": country,
-                "source": source,
-                "title": title,
-                "link": link,
-                "summary": summary[:600],
-            }
-        )
+        if title and link:
+            items.append(
+                {
+                    "country": country,
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "summary": summary[:600],
+                }
+            )
         if len(items) >= max_items:
             break
     return items
@@ -146,9 +128,11 @@ async def fetch_feed_deep_dive(country: str, source: str, url: str, max_items: i
 
 @workflows.activity()
 async def write_report(feed_items: list[dict], model: str) -> str:
-    """Call a Mistral model to write the deep-dive report from the headlines."""
+    """Call a Mistral model to write the weekly deep-dive report."""
     from datetime import datetime
 
+    # The current date is computed in the activity (allowed: activities may
+    # use non-deterministic sources) so the model never has to guess it.
     today = datetime.now().strftime("%A %-d %B %Y")
 
     grouped: dict[str, list[dict]] = {country: [] for country in COUNTRIES}
@@ -164,28 +148,26 @@ async def write_report(feed_items: list[dict], model: str) -> str:
         sections.append("\n".join(lines))
 
     prompt = (
-        f"You are writing Guðmundur's weekly Sunday news deep-dive report for **{today}**, "
-        "covering the United Kingdom, Ireland, Sweden and Denmark, from news of the "
-        "last 7 days.\n\n"
+        f"You are writing Guðmundur's weekly news deep-dive report for **Sunday {today}**, "
+        "covering the United Kingdom, Ireland, Sweden and Denmark, reviewing the week "
+        "just ended and looking ahead.\n\n"
         "Rules:\n"
         "- Organise by country with clear headings, preceded by a one-paragraph overview "
-        "of the biggest themes of the week across all four countries.\n"
-        "- For each significant story: what happened this week, and why it matters — "
-        "background, implications, key reactions and stakeholders. Where the story "
-        "developed over several days, trace the arc of the week rather than listing "
-        "individual headlines.\n"
-        "- Note what to watch next week for developing stories.\n"
-        "- Cite sources with the links given. Translate Swedish and Danish headlines and "
-        "summaries into English.\n"
-        "- Depth over breadth: pick the most significant stories and treat them "
-        "thoroughly and analytically. This is the fullest weekly analysis — noticeably "
-        "longer and more exhaustive than the daily morning brief.\n"
-        "- If a country has no significant news, say so briefly.\n"
+        "of the week across all four countries.\n"
+        "- This is the fullest analysis of the week: deeper and more exhaustive than the "
+        "daily morning brief. For each significant story: what happened, why it matters — "
+        "background, implications, key reactions and stakeholders — and what to watch next. "
+        "Trace developments across the week rather than listing single headlines.\n"
+        "- Draw on domestic-language sources (Swedish, Danish, Irish) for local perspective "
+        "and commentary; translate into English. Cross-reference international sources "
+        "for cross-border stories.\n"
+        "- Cite sources with the links given. If a summary is thin, present the story "
+        "cautiously from the headline alone rather than inventing detail.\n"
+        "- End with a short 'The week ahead' section of things to watch in each country.\n"
+        "- If a country had a quiet week, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
-        "- If a headline's summary is thin, present the story cautiously from the "
-        "headline alone rather than inventing detail.\n"
-        f"- Date the report {today}.\n\n"
-        "Fetched headlines (last 7 days):\n\n" + "\n\n".join(sections)
+        f"- Date the report Sunday {today}.\n\n"
+        "Fetched headlines:\n\n" + "\n\n".join(sections)
     )
 
     request = ChatCompletionRequest(
@@ -204,7 +186,7 @@ class WeeklyNewsDeepDiveWorkflow:
         feeds_ok: list[str] = []
         feeds_failed: list[str] = []
         for country, source, url in FEEDS:
-            feed_items = await fetch_feed_deep_dive(country, source, url, data.max_items_per_feed)
+            feed_items = await fetch_feed(country, source, url, data.max_items_per_feed)
             if feed_items:
                 items.extend(feed_items)
                 feeds_ok.append(f"{source} ({country})")
