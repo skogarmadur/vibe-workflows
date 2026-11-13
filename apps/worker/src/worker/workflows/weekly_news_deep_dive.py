@@ -190,12 +190,18 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
     result = await mistralai_chat_complete(request)
     content = result.choices[0].message.content
     if isinstance(content, list):
-        # Model replies may arrive as content blocks (e.g. thinking + text);
-        # flatten them to a single string.
-        content = "".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
-        )
+        # Model replies may arrive as content blocks (e.g. thinking + text).
+        # Keep ONLY the text of each block; skip thinking content entirely.
+        parts = []
+        for block in content:
+            text = None
+            if isinstance(block, dict):
+                text = block.get("text")
+            else:
+                text = getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        content = "\n\n".join(parts)
     return content or ""
 
 
