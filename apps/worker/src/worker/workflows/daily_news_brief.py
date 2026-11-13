@@ -179,7 +179,15 @@ async def write_brief(feed_items: list[dict], model: str) -> str:
         messages=[UserMessage(content=prompt)],
     )
     result = await mistralai_chat_complete(request)
-    return result.choices[0].message.content or ""
+    content = result.choices[0].message.content
+    if isinstance(content, list):
+        # Model replies may arrive as content blocks (e.g. thinking + text);
+        # flatten them to a single string.
+        content = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    return content or ""
 
 
 @workflows.workflow.define(name="daily_news_brief")
