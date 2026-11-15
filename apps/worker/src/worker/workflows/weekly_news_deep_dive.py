@@ -13,6 +13,8 @@ across all workflows served by this worker.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import re
 import xml.etree.ElementTree as ET
 
@@ -89,7 +91,10 @@ class DeepDiveOutput(BaseModel):
     model: str
 
 
-@workflows.activity()
+@workflows.activity(
+    start_to_close_timeout=timedelta(seconds=90),
+    retry_policy_max_attempts=2,
+)
 async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: int) -> list[dict]:
     """Fetch and parse one public RSS feed. Failures return [] (handled upstream)."""
     import httpx
@@ -127,7 +132,9 @@ async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: in
     return items
 
 
-@workflows.activity()
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=10),
+)
 async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
     """Call a Mistral model to write the weekly deep-dive report."""
     from datetime import datetime
