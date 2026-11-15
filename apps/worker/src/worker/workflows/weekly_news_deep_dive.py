@@ -1,11 +1,11 @@
 """Weekly news deep-dive workflow: UK, Ireland, Sweden, Denmark, France.
 
 Sunday complement to the daily brief: fetches a wider set of domestic-language
-RSS feeds, then writes Guðmundur's weekly deep-dive report via a Mistral model
-call. Deeper analysis than the daily brief; draws on commentary and analysis
-angles where the feeds expose them. Designed for an unattended scheduled run:
-reads only public feeds, no user-scope credentials. Deliverable is the
-execution result (read in Studio / delivered via the 08:35 relay task).
+RSS feeds, then writes Guðmundur's weekly deep-dive report via several small
+Mistral model calls (one per country, plus a short overview pass). The
+platform HTTP client read-times-out long model calls (~5 minutes), so no
+single call may cover every feed at once, and each country is its own
+activity so a retry only replays one small call.
 
 Activity names are suffixed `_deepdive` because activity names must be unique
 across all workflows served by this worker.
@@ -14,7 +14,6 @@ across all workflows served by this worker.
 from __future__ import annotations
 
 from datetime import timedelta
-
 import re
 import xml.etree.ElementTree as ET
 
@@ -26,9 +25,6 @@ from mistralai.workflows.plugins.mistralai import (
 )
 from pydantic import BaseModel, Field
 
-# Public RSS feeds, verified reachable on 2026-11-12. Wider than the daily brief:
-# adds Irish Times, SvD, Expressen, GP, Berlingske, the Guardian's world feed,
-# four French outlets, and the Guardian's environment feed for standing interests.
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
     ("UK", "The Guardian", "https://www.theguardian.com/uk/rss"),
@@ -68,11 +64,21 @@ def _text(element: ET.Element, tag: str) -> str | None:
     found = element.find(tag)
     if found is not None and found.text:
         return found.text
-    # Some feeds wrap text in CDATA or nested elements.
     for descendant in element.iter(tag):
         if descendant.text:
             return descendant.text
     return None
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n\n".join(parts)
+    return content or ""
 
 
 class DeepDiveInput(BaseModel):
@@ -133,50 +139,46 @@ async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: in
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=25),
-    retry_policy_max_attempts=2,
+    start_to_close_timeout=timedelta(minutes=6),
+    retry_policy_max_attempts=3,
 )
-async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
-    """Write the weekly deep-dive report via several smaller Mistral model calls.
+async def write_country_section_deepdive(country: str, feed_items: list[dict], model: str) -> dict:
+    """Write one country's section via a single small model call.
 
-    The platform HTTP client applies a read timeout (~5 minutes) to each
-    model call, so one giant call covering all 19 feeds reliably times out.
-    Writing one section per country (plus a short overview pass) keeps every
-    individual call short enough to complete.
+    Kept small deliberately: the platform HTTP client read-times-out long
+    model calls, and each country is its own activity so a retry only replays
+    one small call. Returns the section plus machine-readable highlights.
     """
     from datetime import datetime
 
-    # The current date is computed in the activity (allowed: activities may
-    # use non-deterministic sources) so the model never has to guess it.
     today = datetime.now().strftime("%A %-d %B %Y")
 
-    grouped: dict[str, list[dict]] = {country: [] for country in COUNTRIES}
+    lines = [f"## {country}"]
     for item in feed_items:
-        grouped.setdefault(item["country"], []).append(item)
+        summary = f" — {item['summary']}" if item.get("summary") else ""
+        lines.append(f"- {item['title']} ({item['source']}){summary}\n  {item['link']}")
+    items_text = "\n".join(lines)
 
-    def _items_text(country: str) -> str:
-        lines = [f"## {country}"]
-        for item in grouped[country]:
-            summary = f" — {item['summary']}" if item.get("summary") else ""
-            lines.append(f"- {item['title']} ({item['source']}){summary}\n  {item['link']}")
-        return "\n".join(lines)
+    if country == "Topics":
+        intro = (
+            "You are writing the environment section of Guðmundur's weekly news "
+            f"deep-dive report for **{today}**, from the Guardian environment feed. "
+            "Guðmundur's standing interest is forestry, woodland restoration and "
+            "conservation: lead with those stories where present, then other major "
+            "environmental news. Give the section the heading "
+            "'## Forestry & Conservation' (subsume other environmental stories under "
+            "it with a subheading if needed).\n\n"
+        )
+    else:
+        intro = (
+            f"You are writing the {country} section of Guðmundur's weekly news "
+            f"deep-dive report for **{today}**, reviewing the week just ended and "
+            "looking ahead.\n\n"
+        )
 
-    async def _chat(prompt: str) -> str:
-        request = ChatCompletionRequest(model=model, messages=[UserMessage(content=prompt)])
-        result = await mistralai_chat_complete(request)
-        content = result.choices[0].message.content
-        if isinstance(content, list):
-            # Model replies may arrive as content blocks (thinking + text):
-            # keep ONLY the text of each block; skip thinking entirely.
-            parts = []
-            for block in content:
-                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
-                if isinstance(text, str):
-                    parts.append(text)
-            content = "\n\n".join(parts)
-        return content or ""
-
-    common_rules = (
+    prompt = (
+        intro
+        + "Rules:\n"
         "- This is the fullest analysis of the week: deeper and more exhaustive than the "
         "daily morning brief. For each significant story: what happened, why it matters — "
         "background, implications, key reactions and stakeholders — and what to watch next. "
@@ -194,53 +196,60 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
         "rather than inventing detail.\n"
         "- If the country had a quiet week, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
+        "- End your reply with exactly this machine-readable block (nothing after it):\n"
+        "<<<HIGHLIGHTS>>>\n"
+        "- <one-line summary of the week's biggest story>\n"
+        "- <one-line summary of the second biggest story>\n"
+        "- <one-line summary of the third biggest story>\n"
+        "<<<WATCH>>>\n"
+        "- <one or two things to watch in this country next week>\n\n"
+        "Fetched headlines:\n\n" + items_text
     )
 
-    sections: list[str] = []
-    for country in COUNTRIES:
-        items = grouped.get(country, [])
-        if not items:
-            if country == "Topics":
-                continue
-            sections.append(f"## {country}\n\nNo feeds available this week.")
-            continue
-        if country == "Topics":
-            prompt = (
-                f"You are writing the environment section of Guðmundur's weekly news "
-                f"deep-dive report for **{today}**, from the Guardian environment feed. "
-                "Guðmundur's standing interest is forestry, woodland restoration and "
-                "conservation: lead with those stories where present, then other major "
-                "environmental news. Give the section the heading "
-                "'## Forestry & Conservation' (subsume other environmental stories under "
-                "it with a subheading if needed).\n\n"
-                "Rules:\n" + common_rules + "\n"
-                "Fetched headlines:\n\n" + _items_text(country)
-            )
-        else:
-            prompt = (
-                f"You are writing the {country} section of Guðmundur's weekly news "
-                f"deep-dive report for **{today}**, reviewing the week just ended and "
-                "looking ahead.\n\n"
-                "Rules:\n" + common_rules +
-                "- Write ONLY this country's section, starting with a '## Country' "
-                "heading. No overall overview; that is written separately.\n\n"
-                "Fetched headlines:\n\n" + _items_text(country)
-            )
-        sections.append(await _chat(prompt))
+    request = ChatCompletionRequest(model=model, messages=[UserMessage(content=prompt)])
+    result = await mistralai_chat_complete(request)
+    content = _extract_text(result.choices[0].message.content)
 
-    overview_prompt = (
-        f"You are writing the opening overview of Guðmundur's weekly news deep-dive "
-        f"report for **{today}** (Sunday), covering the United Kingdom, Ireland, Sweden, "
-        "Denmark and France.\n\n"
-        "Below are the already-written country sections of the report. Write a single "
-        "opening paragraph (no heading) giving the big picture of the week across the "
-        "five countries, then a short '## The week ahead' section with one or two things "
-        "to watch in each country. Write in UK English. Do not repeat the sections in "
-        "detail.\n\n" + "\n\n".join(sections)
+    highlights: list[str] = []
+    watch: list[str] = []
+    section = content
+    if "<<<HIGHLIGHTS>>>" in content:
+        section, rest = content.split("<<<HIGHLIGHTS>>>", 1)
+        hl_block, watch_block = rest, ""
+        if "<<<WATCH>>>" in rest:
+            hl_block, watch_block = rest.split("<<<WATCH>>>", 1)
+        highlights = [l.strip()[2:].strip() for l in hl_block.strip().splitlines() if l.strip().startswith("-")]
+        watch = [l.strip()[2:].strip() for l in watch_block.strip().splitlines() if l.strip().startswith("-")]
+    return {
+        "country": country,
+        "section_markdown": section.strip(),
+        "week_highlights": highlights,
+        "watch_next": watch,
+    }
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=6),
+    retry_policy_max_attempts=3,
+)
+async def write_overview_deepdive(highlights_text: str, model: str) -> str:
+    """Write the opening overview paragraph from the per-country highlights."""
+    from datetime import datetime
+
+    today = datetime.now().strftime("%A %-d %B %Y")
+    prompt = (
+        f"You are writing the opening overview paragraph of Guðmundur's weekly news "
+        f"deep-dive report for **{today}** (Sunday), covering the United Kingdom, "
+        "Ireland, Sweden, Denmark and France.\n\n"
+        "Below are the key points of the week from each country section of the report. "
+        "Write a single opening paragraph (no heading, no bullet points) giving the "
+        "big picture of the week across the five countries. Write in UK English.\n\n"
+        + highlights_text
     )
-    overview = await _chat(overview_prompt)
+    request = ChatCompletionRequest(model=model, messages=[UserMessage(content=prompt)])
+    result = await mistralai_chat_complete(request)
+    return _extract_text(result.choices[0].message.content).strip()
 
-    return overview + "\n\n" + "\n\n".join(sections)
 
 @workflows.workflow.define(name="weekly_news_deep_dive")
 class WeeklyNewsDeepDiveWorkflow:
@@ -270,7 +279,44 @@ class WeeklyNewsDeepDiveWorkflow:
                 model="(dry run, no model call)",
             )
 
-        report = await write_deep_dive_report(items, data.model)
+        grouped: dict[str, list[dict]] = {}
+        for item in items:
+            grouped.setdefault(item["country"], []).append(item)
+
+        sections: list[dict] = []
+        for country in COUNTRIES:
+            feed_items = grouped.get(country, [])
+            if not feed_items:
+                if country == "Topics":
+                    continue
+                sections.append(
+                    {
+                        "country": country,
+                        "section_markdown": f"## {country}\n\nNo feeds available this week.",
+                        "week_highlights": [],
+                        "watch_next": [],
+                    }
+                )
+                continue
+            sections.append(await write_country_section_deepdive(country, feed_items, data.model))
+
+        highlights_text = "\n\n".join(
+            f"{s['country']}:\n" + "\n".join(f"- {h}" for h in s["week_highlights"])
+            for s in sections
+            if s["week_highlights"]
+        )
+        overview = ""
+        if highlights_text:
+            overview = await write_overview_deepdive(highlights_text, data.model)
+
+        week_ahead_lines = ["## The week ahead"]
+        for s in sections:
+            for w in s["watch_next"]:
+                week_ahead_lines.append(f"- **{s['country']}**: {w}")
+        week_ahead = "\n".join(week_ahead_lines) if len(week_ahead_lines) > 1 else ""
+
+        parts = [p for p in (overview, "\n\n".join(s["section_markdown"] for s in sections), week_ahead) if p]
+        report = "\n\n".join(parts)
         return DeepDiveOutput(
             report_markdown=report,
             feeds_ok=feeds_ok,
