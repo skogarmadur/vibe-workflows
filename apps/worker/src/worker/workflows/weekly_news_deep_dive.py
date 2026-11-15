@@ -133,10 +133,17 @@ async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: in
 
 
 @workflows.activity(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=25),
+    retry_policy_max_attempts=2,
 )
 async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
-    """Call a Mistral model to write the weekly deep-dive report."""
+    """Write the weekly deep-dive report via several smaller Mistral model calls.
+
+    The platform HTTP client applies a read timeout (~5 minutes) to each
+    model call, so one giant call covering all 19 feeds reliably times out.
+    Writing one section per country (plus a short overview pass) keeps every
+    individual call short enough to complete.
+    """
     from datetime import datetime
 
     # The current date is computed in the activity (allowed: activities may
@@ -147,70 +154,93 @@ async def write_deep_dive_report(feed_items: list[dict], model: str) -> str:
     for item in feed_items:
         grouped.setdefault(item["country"], []).append(item)
 
-    sections: list[str] = []
-    for country in COUNTRIES:
+    def _items_text(country: str) -> str:
         lines = [f"## {country}"]
         for item in grouped[country]:
             summary = f" — {item['summary']}" if item.get("summary") else ""
             lines.append(f"- {item['title']} ({item['source']}){summary}\n  {item['link']}")
-        sections.append("\n".join(lines))
+        return "\n".join(lines)
 
-    prompt = (
-        f"You are writing Guðmundur's weekly news deep-dive report for **{today}**, "
-        "covering the United Kingdom, Ireland, Sweden, Denmark and France, reviewing "
-        "the week just ended and looking ahead.\n\n"
-        "Rules:\n"
-        "- Organise by country with clear headings, preceded by a one-paragraph overview "
-        "of the week across all five countries.\n"
+    async def _chat(prompt: str) -> str:
+        request = ChatCompletionRequest(model=model, messages=[UserMessage(content=prompt)])
+        result = await mistralai_chat_complete(request)
+        content = result.choices[0].message.content
+        if isinstance(content, list):
+            # Model replies may arrive as content blocks (thinking + text):
+            # keep ONLY the text of each block; skip thinking entirely.
+            parts = []
+            for block in content:
+                text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
+            content = "\n\n".join(parts)
+        return content or ""
+
+    common_rules = (
         "- This is the fullest analysis of the week: deeper and more exhaustive than the "
         "daily morning brief. For each significant story: what happened, why it matters — "
         "background, implications, key reactions and stakeholders — and what to watch next. "
         "Trace developments across the week rather than listing single headlines.\n"
-        "- Draw on domestic-language sources (Swedish, Danish, French, Irish) for local "
-        "perspective and commentary; translate into English. Cross-reference international "
-        "sources for cross-border stories.\n"
+        "- Draw on domestic-language sources for local perspective and commentary; "
+        "translate into English.\n"
         "- Guðmundur has a standing interest in forestry, woodland restoration and "
-        "conservation. Whenever a story in these areas appears — in any country or in "
-        "the Topics feed — include it with the same thorough treatment. Do not force "
-        "coverage if nothing relevant appears.\n"
-        "- The 'Topics' feed (Guardian Environment) is a source for forestry/conservation "
-        "and other environmental stories across countries; fold relevant items into the "
-        "country sections (or the UK section for UK-only stories) rather than creating "
-        "a separate Topics heading.\n"
+        "conservation. Whenever a story in these areas appears, include it with the same "
+        "thorough treatment. Do not force coverage if nothing relevant appears.\n"
         "- Sources with links are MANDATORY: after every story, on its own line, add the "
-        "source link(s) as Markdown, e.g. \"[Politiken](https://...)\", one per line. If "
-        "several fetched items informed the story, list them all. Never present a story "
-        "without at least one link.\n"
+        "source link(s) as Markdown, e.g. \"[Politiken](https://...)\". If several fetched "
+        "items informed the story, list them all. Never present a story without at least "
+        "one link.\n"
         "- If a summary is thin, present the story cautiously from the headline alone "
         "rather than inventing detail.\n"
-        "- End with a short 'The week ahead' section of things to watch in each country.\n"
-        "- If a country had a quiet week, say so briefly.\n"
+        "- If the country had a quiet week, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
-        f"- Date the report {today}.\n\n"
-        "Fetched headlines:\n\n" + "\n\n".join(sections)
     )
 
-    request = ChatCompletionRequest(
-        model=model,
-        messages=[UserMessage(content=prompt)],
-    )
-    result = await mistralai_chat_complete(request)
-    content = result.choices[0].message.content
-    if isinstance(content, list):
-        # Model replies may arrive as content blocks (e.g. thinking + text).
-        # Keep ONLY the text of each block; skip thinking content entirely.
-        parts = []
-        for block in content:
-            text = None
-            if isinstance(block, dict):
-                text = block.get("text")
-            else:
-                text = getattr(block, "text", None)
-            if isinstance(text, str):
-                parts.append(text)
-        content = "\n\n".join(parts)
-    return content or ""
+    sections: list[str] = []
+    for country in COUNTRIES:
+        items = grouped.get(country, [])
+        if not items:
+            if country == "Topics":
+                continue
+            sections.append(f"## {country}\n\nNo feeds available this week.")
+            continue
+        if country == "Topics":
+            prompt = (
+                f"You are writing the environment section of Guðmundur's weekly news "
+                f"deep-dive report for **{today}**, from the Guardian environment feed. "
+                "Guðmundur's standing interest is forestry, woodland restoration and "
+                "conservation: lead with those stories where present, then other major "
+                "environmental news. Give the section the heading "
+                "'## Forestry & Conservation' (subsume other environmental stories under "
+                "it with a subheading if needed).\n\n"
+                "Rules:\n" + common_rules + "\n"
+                "Fetched headlines:\n\n" + _items_text(country)
+            )
+        else:
+            prompt = (
+                f"You are writing the {country} section of Guðmundur's weekly news "
+                f"deep-dive report for **{today}**, reviewing the week just ended and "
+                "looking ahead.\n\n"
+                "Rules:\n" + common_rules +
+                "- Write ONLY this country's section, starting with a '## Country' "
+                "heading. No overall overview; that is written separately.\n\n"
+                "Fetched headlines:\n\n" + _items_text(country)
+            )
+        sections.append(await _chat(prompt))
 
+    overview_prompt = (
+        f"You are writing the opening overview of Guðmundur's weekly news deep-dive "
+        f"report for **{today}** (Sunday), covering the United Kingdom, Ireland, Sweden, "
+        "Denmark and France.\n\n"
+        "Below are the already-written country sections of the report. Write a single "
+        "opening paragraph (no heading) giving the big picture of the week across the "
+        "five countries, then a short '## The week ahead' section with one or two things "
+        "to watch in each country. Write in UK English. Do not repeat the sections in "
+        "detail.\n\n" + "\n\n".join(sections)
+    )
+    overview = await _chat(overview_prompt)
+
+    return overview + "\n\n" + "\n\n".join(sections)
 
 @workflows.workflow.define(name="weekly_news_deep_dive")
 class WeeklyNewsDeepDiveWorkflow:
