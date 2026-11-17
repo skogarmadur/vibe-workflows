@@ -2,10 +2,11 @@
 
 Fetches headlines from domestic-language RSS feeds for the last 24 hours,
 then writes Guðmundur's morning brief via several small Mistral model calls
-(one per country, plus a short overview pass). The platform HTTP client
-read-times-out model calls that take too long (~5 minutes), so no single
-call may cover every feed at once, and each country is its own activity so
-a retry only replays one small call.
+(one per country, one for the dedicated woodlands/forestry slot, plus a
+short overview pass). The platform HTTP client read-times-out model calls
+that take too long (~5 minutes), so no single call may cover every feed at
+once, and each section is its own activity so a retry only replays one
+small call.
 
 Designed for an unattended scheduled run: reads only public feeds, no
 user-scope credentials. Deliverable is the execution result (read in Studio).
@@ -42,6 +43,11 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
 )
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France")
+
+WOODLAND_EMPTY_LINE = (
+    "Nothing of note today on woodlands, forestry or woodland restoration "
+    "across the covered countries."
+)
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -166,9 +172,7 @@ async def write_country_section(country: str, feed_items: list[dict], topics_ite
         topics_text = (
             "Additional cross-border environment feed (Guardian Environment; "
             "fold any relevant items into this section if they concern this "
-            "country or are otherwise significant, and include forestry, "
-            "woodland restoration and conservation stories wherever they "
-            "appear):\n\n" + "\n".join(tlines)
+            "country or are otherwise significant):\n\n" + "\n".join(tlines)
         )
 
     prompt = (
@@ -183,11 +187,13 @@ async def write_country_section(country: str, feed_items: list[dict], topics_ite
         "one link.\n"
         "- Translate Swedish, Danish and French headlines and summaries into English.\n"
         "- Depth over breadth: pick the most significant stories and treat them thoroughly; "
-        "this is a thorough but digestible morning read, not an exhaustive report.\n"        "- Hard length cap: at most the four most significant stories, and keep the "
+        "this is a thorough but digestible morning read, not an exhaustive report.\n"
+        "- Hard length cap: at most the four most significant stories, and keep the "
         "whole section under 500 words.\n"
         "- Guðmundur has a standing interest in forestry, woodland restoration and "
-        "conservation. Whenever a story in these areas appears, include it and give it "
-        "the same thorough treatment. Do not force coverage if nothing relevant appears.\n"
+        "conservation. Forestry and woodland stories are covered in a separate dedicated "
+        "section of the brief: do NOT include them here, so the slots stay free for other "
+        "news. Other environment stories may be included if significant.\n"
         "- If the country has no significant news, say so briefly.\n"
         "- Write in UK English (colour, organise, realise).\n"
         "- If a headline's summary is thin, present the story cautiously from the headline "
@@ -224,6 +230,75 @@ async def write_country_section(country: str, feed_items: list[dict], topics_ite
         "section_markdown": section.strip(),
         "top_stories": top_stories,
     }
+
+
+@workflows.activity(
+    start_to_close_timeout=timedelta(minutes=6),
+    retry_policy_max_attempts=3,
+)
+async def write_woodland_section(topics_items: list[dict], model: str) -> str:
+    """Write the dedicated woodlands/forestry section via one small model call.
+
+    Guaranteed slot for Guðmundur's standing interest in forestry, woodland
+    restoration and conservation. If there is nothing of worth in the last
+    24 hours, the section says so in one line rather than being silently
+    dropped.
+    """
+    if not topics_items:
+        return f"## Woodlands & Forestry\n\n{WOODLAND_EMPTY_LINE}"
+
+    from datetime import datetime
+
+    today = datetime.now().strftime("%A %-d %B %Y")
+
+    tlines = []
+    for item in topics_items:
+        summary = f" — {item['summary']}" if item.get("summary") else ""
+        tlines.append(f"- {item['title']} ({item['source']}){summary}\n  {item['link']}")
+    items_text = "\n".join(tlines)
+
+    prompt = (
+        f"You are writing the woodlands & forestry section of Guðmundur's daily "
+        f"morning news brief for **{today}**, from news of the last 24 hours. "
+        "This is a dedicated slot for his standing interest in forestry, woodland "
+        "restoration and conservation across the United Kingdom, Ireland, Sweden, "
+        "Denmark and France (plus significant cross-border European stories).\n\n"
+        "Rules:\n"
+        "- From the environment feed items below, select only stories that are "
+        "genuinely about forests, woodlands, forestry, tree planting, afforestation, "
+        "reforestation or forest/woodland conservation. Stories about other "
+        "environmental topics (marine, climate policy, wildlife unrelated to "
+        "woodland) do NOT belong here.\n"
+        "- Relevance filter: prefer stories concerning the five covered countries; "
+        "include a wider European or global story only if it is genuinely "
+        "significant.\n"
+        "- For each story: what happened, and why it matters — background, "
+        "implications, key reactions and stakeholders. For developing stories, note "
+        "what to watch next.\n"
+        "- Sources with links are MANDATORY: after every story, on its own line, add "
+        "the source link(s) as Markdown, e.g. \"[The Guardian](https://...)\".\n"
+        "- Length cap: at most two stories, and keep the whole section under 200 "
+        "words.\n"
+        "- If NOTHING in the feed is a forestry/woodland/conservation story of "
+        "worth, write exactly this section and nothing else:\n"
+        "## Woodlands & Forestry\n\n"
+        "Nothing of note today on woodlands, forestry or woodland restoration "
+        "across the covered countries.\n"
+        "Do not pad with weakly related items.\n"
+        "- Write in UK English (colour, organise, realise).\n"
+        "- If a headline's summary is thin, present the story cautiously from the "
+        "headline alone rather than inventing detail.\n"
+        "- Write ONLY the section, starting with the '## Woodlands & Forestry' "
+        "heading. No overview, no sign-off.\n\n"
+        "Environment feed items (last 24 hours):\n\n" + items_text
+    )
+
+    request = ChatCompletionRequest(
+        model=model,
+        messages=[UserMessage(content=prompt)],
+    )
+    result = await mistralai_chat_complete(request)
+    return _extract_text(result.choices[0].message.content).strip()
 
 
 @workflows.activity(
@@ -301,6 +376,8 @@ class DailyNewsBriefWorkflow:
                 await write_country_section(country, feed_items, topics_items, data.model)
             )
 
+        woodland_section = await write_woodland_section(topics_items, data.model)
+
         top_stories_text = "\n\n".join(
             f"{s['country']}:\n" + "\n".join(f"- {t}" for t in s["top_stories"])
             for s in sections
@@ -310,7 +387,15 @@ class DailyNewsBriefWorkflow:
         if top_stories_text:
             overview = await write_daily_overview(top_stories_text, data.model)
 
-        parts = [p for p in (overview, "\n\n".join(s["section_markdown"] for s in sections)) if p]
+        parts = [
+            p
+            for p in (
+                overview,
+                "\n\n".join(s["section_markdown"] for s in sections),
+                woodland_section,
+            )
+            if p
+        ]
         brief = "\n\n".join(parts)
         return NewsBriefOutput(
             brief_markdown=brief,
