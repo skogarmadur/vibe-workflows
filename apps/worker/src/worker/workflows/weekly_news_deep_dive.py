@@ -9,6 +9,13 @@ activity so a retry only replays one small call.
 
 Activity names are suffixed `_deepdive` because activity names must be unique
 across all workflows served by this worker.
+
+Before writing sections, the workflow asks the long-lived headlines_archive
+workflow for the headlines of each day's morning brief this week, and passes
+that "already covered" list into every section prompt, so the weekly focuses
+on the week's genuine developments and multi-day threads rather than
+re-reporting yesterday's daily stories. Archive interaction is best-effort:
+if the archive is missing or slow, the weekly degrades to the old behaviour.
 """
 
 from __future__ import annotations
@@ -17,6 +24,8 @@ from datetime import timedelta
 import re
 import xml.etree.ElementTree as ET
 
+from temporalio import workflow as _tw
+
 import mistralai.workflows as workflows
 from mistralai.workflows.plugins.mistralai import (
     ChatCompletionRequest,
@@ -24,6 +33,12 @@ from mistralai.workflows.plugins.mistralai import (
     mistralai_chat_complete,
 )
 from pydantic import BaseModel, Field
+
+from worker.workflows.headlines_archive import (
+    HEADLINES_ARCHIVE_WORKFLOW_ID,
+    REQUEST_RECENT_SIGNAL,
+    RECEIVE_RECENT_SIGNAL,
+)
 
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
@@ -49,6 +64,9 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France", "Topics")
 
+RECENT_DAYS = 7
+RECENT_WAIT_SECONDS = 45
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -60,7 +78,7 @@ def _clean(text: str | None) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
-def _text(element: ET.Element, tag: str) -> str | None:
+def _text(element: ET.Element, tag: str) -> str:
     found = element.find(tag)
     if found is not None and found.text:
         return found.text
@@ -79,6 +97,24 @@ def _extract_text(content) -> str:
                 parts.append(text)
         return "\n\n".join(parts)
     return content or ""
+
+
+def _already_covered_text(entries: list) -> str:
+    """Format recent daily-brief headlines as an 'already covered' block."""
+    lines = []
+    for raw in sorted(entries, key=lambda e: e.get("date", "")):
+        if not isinstance(raw, dict):
+            continue
+        date = str(raw.get("date", ""))[:10]
+        headlines = [str(h) for h in (raw.get("headlines") or [])]
+        if not date or not headlines:
+            continue
+        joined = "; ".join(h[:MAX_COVERED_JOIN_LEN] for h in headlines)
+        lines.append(f"- {date}: {joined}")
+    return "\n".join(lines)
+
+
+MAX_COVERED_JOIN_LEN = 160
 
 
 class DeepDiveInput(BaseModel):
@@ -142,7 +178,9 @@ async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: in
     start_to_close_timeout=timedelta(minutes=6),
     retry_policy_max_attempts=3,
 )
-async def write_country_section_deepdive(country: str, feed_items: list[dict], model: str) -> dict:
+async def write_country_section_deepdive(
+    country: str, feed_items: list[dict], model: str, already_covered: str = ""
+) -> dict:
     """Write one country's section via a single small model call.
 
     Kept small deliberately: the platform HTTP client read-times-out long
@@ -176,8 +214,23 @@ async def write_country_section_deepdive(country: str, feed_items: list[dict], m
             "looking ahead.\n\n"
         )
 
+    covered_block = ""
+    if already_covered:
+        covered_block = (
+            "Headlines already covered in this week's daily morning briefs, by date:\n\n"
+            + already_covered
+            + "\n\n"
+            "These stories have already been reported to Guðmundur this morning-by-morning. "
+            "They must NOT be re-reported as this week's news in isolation. Include a "
+            "story from that list ONLY if it is part of a thread that genuinely developed "
+            "across MULTIPLE days of the week: in that case trace the full week-long arc, "
+            "including what changed and what the daily coverage could not yet know. "
+            "Prioritise the week's significant developments the dailies have NOT covered.\n\n"
+        )
+
     prompt = (
         intro
+        + covered_block
         + "Rules:\n"
         "- This is the fullest analysis of the week: deeper and more exhaustive than the "
         "daily morning brief. For each significant story: what happened, why it matters — "
@@ -259,6 +312,31 @@ async def write_overview_deepdive(highlights_text: str, model: str) -> str:
 
 @workflows.workflow.define(name="weekly_news_deep_dive")
 class WeeklyNewsDeepDiveWorkflow:
+    _recent_entries: list | None = None
+
+    @workflows.workflow.signal(name=RECEIVE_RECENT_SIGNAL)
+    async def receive_recent(self, entries: list) -> None:
+        """Store the archive's reply (recent daily-brief headlines)."""
+        self._recent_entries = list(entries or [])
+
+    async def _fetch_recent_headlines(self) -> str:
+        """Ask the archive for this week's daily headlines. Best-effort."""
+        try:
+            me = _tw.info().workflow_id
+            handle = _tw.get_external_workflow_handle(HEADLINES_ARCHIVE_WORKFLOW_ID)
+            await handle.signal(
+                REQUEST_RECENT_SIGNAL, {"requester_id": me, "days": RECENT_DAYS}
+            )
+            await _tw.wait_condition(
+                lambda: self._recent_entries is not None,
+                timeout=timedelta(seconds=RECENT_WAIT_SECONDS),
+            )
+        except Exception:
+            return ""
+        if not self._recent_entries:
+            return ""
+        return _already_covered_text(self._recent_entries)
+
     @workflows.workflow.entrypoint
     async def run(self, data: DeepDiveInput) -> DeepDiveOutput:
         items: list[dict] = []
@@ -285,6 +363,9 @@ class WeeklyNewsDeepDiveWorkflow:
                 model="(dry run, no model call)",
             )
 
+        self._recent_entries = None
+        already_covered = await self._fetch_recent_headlines()
+
         grouped: dict[str, list[dict]] = {}
         for item in items:
             grouped.setdefault(item["country"], []).append(item)
@@ -304,7 +385,11 @@ class WeeklyNewsDeepDiveWorkflow:
                     }
                 )
                 continue
-            sections.append(await write_country_section_deepdive(country, feed_items, data.model))
+            sections.append(
+                await write_country_section_deepdive(
+                    country, feed_items, data.model, already_covered
+                )
+            )
 
         highlights_text = "\n\n".join(
             f"{s['country']}:\n" + "\n".join(f"- {h}" for h in s["week_highlights"])

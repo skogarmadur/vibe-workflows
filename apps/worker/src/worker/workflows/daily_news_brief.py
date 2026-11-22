@@ -10,6 +10,11 @@ small call.
 
 Designed for an unattended scheduled run: reads only public feeds, no
 user-scope credentials. Deliverable is the execution result (read in Studio).
+
+After the brief is assembled, the day's story headlines are pushed to the
+long-lived headlines_archive workflow (best-effort): the weekly deep-dive
+reads that archive to avoid re-reporting stories the dailies already
+covered. The archive push NEVER fails the daily.
 """
 
 from __future__ import annotations
@@ -17,6 +22,10 @@ from __future__ import annotations
 from datetime import timedelta
 import re
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
+
+import temporalio.common as _tcommon
+from temporalio import workflow as _tw
 
 import mistralai.workflows as workflows
 from mistralai.workflows.plugins.mistralai import (
@@ -26,8 +35,12 @@ from mistralai.workflows.plugins.mistralai import (
 )
 from pydantic import BaseModel, Field
 
-# Public RSS feeds, verified reachable 2026-11-12. One feed per (country, source).
-# "Topics" feeds cover standing interests that cross borders.
+from worker.workflows.headlines_archive import (
+    HEADLINES_ARCHIVE_WORKFLOW_ID,
+    HeadlinesArchiveWorkflow,
+    RECORD_DAY_SIGNAL,
+)
+
 FEEDS: tuple[tuple[str, str, str], ...] = (
     ("UK", "BBC News", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
     ("UK", "The Guardian", "https://www.theguardian.com/uk/rss"),
@@ -51,6 +64,7 @@ WOODLAND_EMPTY_LINE = (
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_BOLD_HEADLINE_RE = re.compile(r"^\*\*(.+?)\*\*", re.MULTILINE)
 
 
 def _clean(text: str | None) -> str:
@@ -60,7 +74,7 @@ def _clean(text: str | None) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 
-def _text(element: ET.Element, tag: str) -> str | None:
+def _text(element: ET.Element, tag: str) -> str:
     found = element.find(tag)
     if found is not None and found.text:
         return found.text
@@ -84,6 +98,55 @@ def _extract_text(content) -> str:
     return content or ""
 
 
+def _story_headlines(markdown_text: str) -> list[str]:
+    """Extract bold story headlines from assembled section markdown."""
+    out: list[str] = []
+    for h in _BOLD_HEADLINE_RE.findall(markdown_text):
+        h = h.strip().rstrip(".").strip()
+        if h and len(h) > 12 and h not in out:
+            out.append(h[:160])
+    return out[:40]
+
+
+def _daily_date() -> str:
+    """Date string (Atlantic/Reykjavik) for the archive entry. Deterministic."""
+    now = _tw.now()
+    try:
+        return now.astimezone(ZoneInfo("Atlantic/Reykjavik")).date().isoformat()
+    except Exception:
+        return now.date().isoformat()
+
+
+async def _record_daily_headlines(date: str, headlines: list[str]) -> bool:
+    """Best-effort push to the running headlines archive. Never raises.
+
+    Starts the archive workflow if it is not running yet (id-reuse ALLOW_DUPLICATE
+    makes this a no-op when it already runs), then signals record_day. Any
+    failure is swallowed: the daily brief must never break because of the
+    archive.
+    """
+    if not date or not headlines:
+        return False
+    try:
+        try:
+            # Will raise if the archive is already running: the normal case
+            # from the second day onwards.
+            await _tw.start_child_workflow(
+                workflows.get_workflow_definition(HeadlinesArchiveWorkflow).name,
+                {"entries": []},
+                id=HEADLINES_ARCHIVE_WORKFLOW_ID,
+                id_reuse_policy=_tcommon.WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                parent_close_policy=_tw.ParentClosePolicy.ABANDON,
+            )
+        except Exception:
+            pass
+        handle = _tw.get_external_workflow_handle(HEADLINES_ARCHIVE_WORKFLOW_ID)
+        await handle.signal(RECORD_DAY_SIGNAL, {"date": date, "headlines": headlines})
+        return True
+    except Exception:
+        return False
+
+
 class NewsBriefInput(BaseModel):
     """Input for the daily news brief."""
 
@@ -98,6 +161,7 @@ class NewsBriefOutput(BaseModel):
     feeds_failed: list[str]
     item_count: int
     model: str
+    archived_headlines: int = 0
 
 
 @workflows.activity(
@@ -179,6 +243,8 @@ async def write_country_section(country: str, feed_items: list[dict], topics_ite
         f"You are writing the {country} section of Guðmundur's daily morning news "
         f"brief for **{today}**, from news of the last 24 hours.\n\n"
         "Rules:\n"
+        "- Begin every story with its headline in bold, followed by an em dash and "
+        "the story, e.g. \"**Headline** — what happened and why it matters...\".\n"
         "- For each story: what happened, and why it matters — background, implications, "
         "key reactions and stakeholders. For developing stories, note what to watch next.\n"
         "- Sources with links are MANDATORY: after every story, on its own line, add the "
@@ -276,6 +342,8 @@ async def write_woodland_section(topics_items: list[dict], model: str) -> str:
         "- Relevance filter: prefer stories concerning the five covered countries; "
         "include a wider European or global story only if it is genuinely "
         "significant.\n"
+        "- Begin every story with its headline in bold, followed by an em dash and "
+        "the story, e.g. \"**Headline** — what happened and why it matters...\".\n"
         "- For each story: what happened, and why it matters — background, "
         "implications, key reactions and stakeholders. For developing stories, note "
         "what to watch next.\n"
@@ -401,10 +469,18 @@ class DailyNewsBriefWorkflow:
             if p
         ]
         brief = "\n\n".join(parts)
+
+        archived = 0
+        if not data.dry_run:
+            headlines = _story_headlines(brief)
+            if await _record_daily_headlines(_daily_date(), headlines):
+                archived = len(headlines)
+
         return NewsBriefOutput(
             brief_markdown=brief,
             feeds_ok=feeds_ok,
             feeds_failed=feeds_failed,
             item_count=len(items),
             model=data.model,
+            archived_headlines=archived,
         )
