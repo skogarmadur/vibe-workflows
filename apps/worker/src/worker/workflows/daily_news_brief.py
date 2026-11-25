@@ -54,6 +54,10 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
     ("France", "franceinfo", "https://www.francetvinfo.fr/titres.rss"),
     ("Topics", "The Guardian (Environment)", "https://www.theguardian.com/environment/rss"),
     ("Topics", "BBC Science & Environment", "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
+    ("Topics", "TheJournal.ie (Environment)", "https://www.thejournal.ie/category/environment/feed/"),
+    ("Topics", "RTÉ (Environment)", "https://www.rte.ie/feeds/rss/?index=/news/environment/"),
+    ("Topics", "SVT Nyheter (Science/Environment)", "https://www.svt.se/nyheter/vetenskap/rss.xml"),
+    ("Topics", "franceinfo (Environment)", "https://www.franceinfo.fr/environnement.rss"),
 )
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France")
@@ -439,7 +443,7 @@ class DailyNewsBriefWorkflow:
         grouped: dict[str, list[dict]] = {}
         for item in items:
             grouped.setdefault(item["country"], []).append(item)
-        topics_items = grouped.pop("Topics", [])
+        topics_items = grouped.pop("Topics", [])[:16]  # cap folded-in topics to keep prompts bounded
 
         sections: list[dict] = []
         for country in COUNTRIES:

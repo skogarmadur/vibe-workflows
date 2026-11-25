@@ -61,6 +61,10 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
     ("France", "Ouest-France", "https://www.ouest-france.fr/rss-en-continu.xml"),
     ("Topics", "The Guardian (Environment)", "https://www.theguardian.com/environment/rss"),
     ("Topics", "BBC Science & Environment", "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
+    ("Topics", "TheJournal.ie (Environment)", "https://www.thejournal.ie/category/environment/feed/"),
+    ("Topics", "RTÉ (Environment)", "https://www.rte.ie/feeds/rss/?index=/news/environment/"),
+    ("Topics", "SVT Nyheter (Science/Environment)", "https://www.svt.se/nyheter/vetenskap/rss.xml"),
+    ("Topics", "franceinfo (Environment)", "https://www.franceinfo.fr/environnement.rss"),
 )
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France", "Topics")
