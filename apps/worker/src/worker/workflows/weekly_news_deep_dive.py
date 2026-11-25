@@ -60,6 +60,7 @@ FEEDS: tuple[tuple[str, str, str], ...] = (
     ("France", "franceinfo", "https://www.francetvinfo.fr/titres.rss"),
     ("France", "Ouest-France", "https://www.ouest-france.fr/rss-en-continu.xml"),
     ("Topics", "The Guardian (Environment)", "https://www.theguardian.com/environment/rss"),
+    ("Topics", "BBC Science & Environment", "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
 )
 
 COUNTRIES = ("UK", "Ireland", "Sweden", "Denmark", "France", "Topics")
@@ -141,14 +142,22 @@ async def fetch_feed_deepdive(country: str, source: str, url: str, max_items: in
     """Fetch and parse one public RSS feed. Failures return [] (handled upstream)."""
     import httpx
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(15.0),
-        headers={"User-Agent": "Mozilla/5.0 (compatible; news-brief-workflow/1.0)"},
-        follow_redirects=True,
-    ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        content = response.text
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0),
+        headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            },
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            content = response.text
+    except Exception:
+        # Blocked (e.g. Guardian 403s since 24 Nov 2026), unreachable or
+        # slow feed: degrade to empty, reported via feeds_failed upstream.
+        return []
 
     items: list[dict] = []
     try:
